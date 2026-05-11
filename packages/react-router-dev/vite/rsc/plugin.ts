@@ -30,6 +30,12 @@ import { validatePluginOrder } from "../plugins/validate-plugin-order";
 import { warnOnClientSourceMaps } from "../plugins/warn-on-client-source-maps";
 import { prerender } from "../plugins/prerender";
 import { getPrerenderPaths } from "../plugin";
+import {
+  RSC_COMPATIBILITY_VERSION_PLACEHOLDER,
+  createRSCCompatibilityVersion,
+  getRSCPluginApi,
+  type RSCPluginApi,
+} from "./compatibility-version";
 
 const redirectStatusCodes = new Set([301, 302, 303, 307, 308]);
 
@@ -51,18 +57,23 @@ export function reactRouterRSCVitePlugin(): Vite.PluginOption[] {
   let routeIdByFile: Map<string, string> | undefined;
   let logger: Vite.Logger;
   let entries: { client: string; rsc: string; ssr: string };
+  let rootDirectory: string;
+  let rscPluginApi: RSCPluginApi | undefined;
+  let rscServerActionEncryptionSalt: string | undefined;
 
   let config: ResolvedReactRouterConfig;
   let rootRouteFile: string;
-  let rscVersion = `${Date.now().toString(36)}-${Math.random()
+  let devRSCVersion = `${Date.now().toString(36)}-${Math.random()
     .toString(36)
     .slice(2)}`;
+  let rscVersionPromise: Promise<string> | undefined;
   function updateConfig(newConfig: ResolvedReactRouterConfig) {
     config = newConfig;
     rootRouteFile = Path.resolve(
       newConfig.appDirectory,
       newConfig.routes.root.file,
     );
+    rscVersionPromise = undefined;
   }
 
   function isRootRouteModule(id: string): boolean {
@@ -79,11 +90,6 @@ export function reactRouterRSCVitePlugin(): Vite.PluginOption[] {
     return Array.from(routeIdByFile ?? []).find(([routeFile]) =>
       path.normalize(routeFile).endsWith(normalizedFile),
     )?.[1];
-  }
-
-  function isMdxRouteModule(filename: string) {
-    let extension = path.extname(filename).toLowerCase();
-    return extension === ".md" || extension === ".mdx";
   }
 
   function getTransformLanguage(
@@ -138,6 +144,25 @@ export function reactRouterRSCVitePlugin(): Vite.PluginOption[] {
     ).code;
   }
 
+  async function getRSCVersion() {
+    if (viteCommand !== "build") {
+      return devRSCVersion;
+    }
+
+    if (!rscPluginApi) {
+      throw new Error(
+        `The "@vitejs/plugin-rsc" plugin must be configured after the React Router RSC plugin to generate an RSC compatibility version.`,
+      );
+    }
+
+    rscVersionPromise ??= createRSCCompatibilityVersion({
+      rootDirectory,
+      rscPluginApi,
+      serverActionEncryptionSalt: rscServerActionEncryptionSalt,
+    });
+    return await rscVersionPromise;
+  }
+
   return [
     {
       name: "react-router/rsc",
@@ -146,7 +171,7 @@ export function reactRouterRSCVitePlugin(): Vite.PluginOption[] {
         await preloadVite();
 
         viteCommand = command;
-        const rootDirectory = getRootDirectory(viteUserConfig);
+        rootDirectory = getRootDirectory(viteUserConfig);
         const watch =
           command === "serve" && process.env.IS_RR_BUILD_REQUEST !== "yes";
 
@@ -358,8 +383,9 @@ export function reactRouterRSCVitePlugin(): Vite.PluginOption[] {
           },
         };
       },
-      configResolved(viteConfig) {
+      async configResolved(viteConfig) {
         resolvedViteConfig = viteConfig;
+        rscPluginApi = await getRSCPluginApi(viteConfig);
       },
       async configureServer(viteDevServer) {
         configLoader.onChange(
@@ -571,6 +597,7 @@ export function reactRouterRSCVitePlugin(): Vite.PluginOption[] {
     },
     {
       name: "react-router/rsc/virtual-version",
+      enforce: "post",
       resolveId(id) {
         if (id === virtual.version.id) {
           return virtual.version.resolvedId;
@@ -578,7 +605,58 @@ export function reactRouterRSCVitePlugin(): Vite.PluginOption[] {
       },
       load(id) {
         if (id === virtual.version.resolvedId) {
-          return `export default ${JSON.stringify(rscVersion)};`;
+          let version =
+            viteCommand === "build"
+              ? RSC_COMPATIBILITY_VERSION_PLACEHOLDER
+              : devRSCVersion;
+          return `export default ${JSON.stringify(version)};`;
+        }
+      },
+      async generateBundle(_options, bundle) {
+        if (viteCommand !== "build") {
+          return;
+        }
+
+        let chunksWithPlaceholder = 0;
+        for (let output of Object.values(bundle)) {
+          if (
+            output.type === "chunk" &&
+            output.code.includes(RSC_COMPATIBILITY_VERSION_PLACEHOLDER)
+          ) {
+            chunksWithPlaceholder++;
+          }
+        }
+
+        if (chunksWithPlaceholder === 0) {
+          return;
+        }
+        let usesBuildGeneratedServerActionEncryption = Object.values(
+          bundle,
+        ).some(
+          (output) =>
+            output.type === "chunk" &&
+            output.code.includes("__vite_rsc_encryption_key"),
+        );
+        if (usesBuildGeneratedServerActionEncryption) {
+          // @vitejs/plugin-rsc generates a fresh default encryption key for
+          // server action closures. Until that key is exposed through the RSC
+          // compiler API, encrypted action builds must remain build-versioned.
+          rscServerActionEncryptionSalt = devRSCVersion;
+        } else {
+          rscServerActionEncryptionSalt = undefined;
+        }
+
+        let version = await getRSCVersion();
+        for (let output of Object.values(bundle)) {
+          if (
+            output.type === "chunk" &&
+            output.code.includes(RSC_COMPATIBILITY_VERSION_PLACEHOLDER)
+          ) {
+            output.code = output.code.replaceAll(
+              RSC_COMPATIBILITY_VERSION_PLACEHOLDER,
+              version,
+            );
+          }
         }
       },
     },
